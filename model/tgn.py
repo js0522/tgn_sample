@@ -1,9 +1,10 @@
 import logging
 import numpy as np
 import torch
+import random
 from collections import defaultdict
 
-from utils.utils import MergeLayer
+from utils.utils import MergeLayer, lenfunc
 from modules.memory import Memory
 from modules.message_aggregator import get_message_aggregator
 from modules.message_function import get_message_function
@@ -49,7 +50,10 @@ class TGN(torch.nn.Module):
     self.time_encoder = TimeEncode(dimension=self.n_node_features)
     self.memory = None
     self.mem_node_prob = mem_node_prob
-
+    #js)
+    self.old_positive = list(range(self.n_nodes))
+    self.adj_list = [[] for _ in range(self.n_nodes + 1)]
+    
     self.mean_time_shift_src = mean_time_shift_src
     self.std_time_shift_src = std_time_shift_src
     self.mean_time_shift_dst = mean_time_shift_dst
@@ -126,7 +130,7 @@ class TGN(torch.nn.Module):
     nodes = np.concatenate([source_nodes, destination_nodes, negative_nodes]) #xzl: all nodes
     positives = np.concatenate([source_nodes, destination_nodes])
     timestamps = np.concatenate([edge_times, edge_times, edge_times])     # xzl: ts for an edge... for src/dest/neg(dest) ... ?
-
+    
     memory = None
     time_diffs = None
     if self.use_memory:
@@ -135,8 +139,9 @@ class TGN(torch.nn.Module):
         # xzl: pull msgs of last batch, cal @memory which is used to cal emeddings 
         #       only after embeddings are cal, cal @memory again and persist it
         #     @self.memory.messages is from previous batch        
-        memory, last_update = self.get_updated_memory(list(range(self.n_nodes)),
+        memory, last_update = self.get_updated_memory(self.old_positive,
                                                       self.memory.messages)
+        self.old_positive=np.copy(positives)
       else:
         # xzl: memory already updated at the end of last batch. now just retrieve it
         memory = self.memory.get_memory(list(range(self.n_nodes)))
@@ -236,7 +241,42 @@ class TGN(torch.nn.Module):
     neg_score = score[n_samples:]
 
     return pos_score.sigmoid(), neg_score.sigmoid()
+  def RandomWalk(self,node,t):
+    walk = [node]        # Walk starts from this node
+    
+    for i in range(t-1):
+      node = self.adj_list[node][random.randint(0,len(self.adj_list[node])-1)]
+      walk.append(node)
 
+    return walk
+  
+  def random_walk(self, idx, num_step):
+    # do random walks on all existing nodes
+    # count the occurrence
+    # output sorted occurrence index list
+    z = [[] for _ in range(self.n_nodes)]
+    x = list(range(self.n_nodes))
+    for i in x:
+      z[i].append(i)
+    index = np.random.choice(np.arange(len(idx)), 
+        int(len(idx)*0.2), replace=False)
+    sampled_nodes = np.array(idx)[index]
+    for i in sampled_nodes:
+      walk=self.RandomWalk(i,num_step)
+      for j in walk:
+        z[j].append(1)
+      
+    
+    sorted_list = z.copy()
+    sorted_list.sort(reverse=True,key=lenfunc)
+    final_list=[]
+    
+    for j in range(len(sorted_list)):
+      final_list.append(sorted_list[j][0])
+    
+    return final_list
+    
+    
   def update_memory(self, nodes, messages):
     # Aggregate messages for the same nodes
     # xzl) first agg then msg func ... seems intentional
@@ -244,19 +284,30 @@ class TGN(torch.nn.Module):
       self.message_aggregator.aggregate(
         nodes,
         messages)
-
+    
     # xzl sampling nodes...
     # print(f"xzl: before sampling. #unique_nodes {len(unique_nodes)}")    
     if self.mem_node_prob < 0.9999:
-      idx = np.random.choice(np.arange(len(unique_nodes)), 
-        int(len(unique_nodes)*self.mem_node_prob), replace=False)
-      sampled_nodes = np.array(unique_nodes)[idx] 
-      #     using sampled nodes, agg message again 
+      num_instance=int(len(nodes)/2)
+      num_save=int(num_instance*self.mem_node_prob)
+      source_batch=np.copy(nodes[:num_instance])
+      destination_batch=np.copy(nodes[num_instance:])
+      for source, destination in zip(source_batch,destination_batch):
+        self.adj_list[source].append(destination)
+        self.adj_list[destination].append(source)
+      idx=[]
+      for i in range(len(self.adj_list)):
+        if len(self.adj_list[i])>0:
+          idx.append(i)
+        
+      
+      sorted_idx_list=self.random_walk(idx, 5)
+      sample_nodes=sorted_idx_list[:num_save]
+        
       unique_nodes, unique_messages, unique_timestamps = \
-        self.message_aggregator.aggregate(
-          sampled_nodes,
-          messages)
-
+      self.message_aggregator.aggregate(
+        sample_nodes,
+        messages)
     # xzl sample --- works, but there's a better way above.
     #print(len(unique_nodes), type(unique_nodes), type(unique_messages))
     # if len(unique_nodes) > 0:
@@ -293,16 +344,7 @@ class TGN(torch.nn.Module):
         nodes,
         messages)
 
-    # xzl: sampling nodes TODO -- deterministic sampling
-    if self.mem_node_prob < 0.9999:
-      idx = np.random.choice(np.arange(len(unique_nodes)), 
-        int(len(unique_nodes)*self.mem_node_prob), replace=False)
-      sampled_nodes = np.array(unique_nodes)[idx] 
-      #     using sampled nodes, agg message again 
-      unique_nodes, unique_messages, unique_timestamps = \
-        self.message_aggregator.aggregate(
-          sampled_nodes,
-          messages)
+    
 
     if len(unique_nodes) > 0:
       unique_messages = self.message_function.compute_message(unique_messages)

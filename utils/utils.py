@@ -188,3 +188,6 @@ class NeighborFinder:
           edge_idxs[i, n_neighbors - len(source_edge_idxs):] = source_edge_idxs
 
     return neighbors, edge_idxs, edge_times
+
+def lenfunc(e):
+  return len(e)
